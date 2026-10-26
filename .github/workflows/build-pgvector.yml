@@ -1,0 +1,144 @@
+# Compila la extensión pgvector (código oficial, tag fijo) para PostgreSQL 17.11 x64 en Windows,
+# corre su suite de regresión oficial (installcheck) y publica solo los archivos de instalación + SHA256.
+# Referencia: job "windows" de https://github.com/pgvector/pgvector/blob/v0.8.7/.github/workflows/build.yml
+name: build-pgvector-windows
+
+on:
+  workflow_dispatch:
+    inputs:
+      pg_zip_url:
+        description: ZIP oficial de binarios PostgreSQL 17.11 Windows x64 (EnterpriseDB)
+        default: https://get.enterprisedb.com/postgresql/postgresql-17.11-5-windows-x64-binaries.zip
+      pg_zip_sha256:
+        description: SHA256 esperado del ZIP (opcional; vacío = solo se informa en el log)
+        default: '80379b2c04d51c30225532e0ae04509899141e9957ed096fe749d7fd9df8f82f'
+
+permissions:
+  contents: read
+
+env:
+  PGVECTOR_TAG: v0.8.7
+  PGVECTOR_COMMIT: f37c13f68b57d2c3472b2214fbcff699d6d34876
+  PG_VERSION: '17.11'
+  PGPORT: '55432'
+  PGHOST: 127.0.0.1
+  PGUSER: postgres
+
+jobs:
+  build:
+    runs-on: windows-2025
+    steps:
+      - name: Checkout pgvector oficial (tag fijo)
+        uses: actions/checkout@v4
+        with:
+          repository: pgvector/pgvector
+          ref: ${{ env.PGVECTOR_TAG }}
+          path: pgvector
+          persist-credentials: false
+
+      - name: Verificar commit del tag
+        shell: pwsh
+        run: |
+          $head = git -C pgvector rev-parse HEAD
+          "pgvector HEAD: $head"
+          if ($head -ne $env:PGVECTOR_COMMIT) { throw "El tag $env:PGVECTOR_TAG no apunta al commit esperado $env:PGVECTOR_COMMIT" }
+
+      - name: Descargar PostgreSQL 17.11 x64 (binarios oficiales EDB)
+        shell: pwsh
+        env:
+          PG_ZIP_URL: ${{ inputs.pg_zip_url }}
+          PG_ZIP_SHA256: ${{ inputs.pg_zip_sha256 }}
+        run: |
+          $zip = "$env:RUNNER_TEMP\pg.zip"
+          Invoke-WebRequest -UseBasicParsing $env:PG_ZIP_URL -OutFile $zip
+          $sha = (Get-FileHash $zip -Algorithm SHA256).Hash.ToLower()
+          "PG zip: $env:PG_ZIP_URL"
+          "PG zip sha256: $sha"
+          if ($env:PG_ZIP_SHA256 -and $sha -ne $env:PG_ZIP_SHA256.ToLower()) { throw "SHA256 del ZIP no coincide" }
+          Expand-Archive $zip -DestinationPath "$env:RUNNER_TEMP\pg"
+          $root = "$env:RUNNER_TEMP\pg\pgsql"
+          $ver = & "$root\bin\pg_config.exe" --version
+          "pg_config: $ver"
+          if ($ver -ne "PostgreSQL $env:PG_VERSION") { throw "Se esperaba PostgreSQL $env:PG_VERSION" }
+          "PGROOT=$root" >> $env:GITHUB_ENV
+          "PG_ZIP_SHA256_REAL=$sha" >> $env:GITHUB_ENV
+          "$root\bin" >> $env:GITHUB_PATH
+
+      - name: Localizar MSVC
+        shell: pwsh
+        run: |
+          $vs = & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+          if (-not $vs) { throw "No se encontró MSVC en el runner" }
+          "VS: $vs"
+          "VCVARS=$vs\VC\Auxiliary\Build\vcvars64.bat" >> $env:GITHUB_ENV
+
+      - name: Iniciar PostgreSQL temporal para installcheck
+        shell: pwsh
+        run: |
+          $data = "$env:RUNNER_TEMP\data"
+          & initdb.exe -D $data -U postgres --auth=trust -E UTF8 --locale=C
+          if ($LASTEXITCODE) { throw "initdb falló" }
+          # Salida a archivos y sin -Wait: el servidor queda vivo y no debe retener la consola del paso
+          Start-Process -FilePath pg_ctl.exe -NoNewWindow `
+            -ArgumentList "-D `"$data`" -l `"$env:RUNNER_TEMP\pg.log`" -o `"-p $env:PGPORT -c listen_addresses=127.0.0.1`" start" `
+            -RedirectStandardOutput "$env:RUNNER_TEMP\pg_ctl.out" -RedirectStandardError "$env:RUNNER_TEMP\pg_ctl.err"
+          foreach ($i in 1..60) { & pg_isready.exe -q; if (-not $LASTEXITCODE) { break }; Start-Sleep 1 }
+          if ($LASTEXITCODE) { Get-Content "$env:RUNNER_TEMP\pg.log"; throw "PostgreSQL no inició" }
+          & psql.exe -At -c "select version()"
+
+      - name: Compilar, instalar y correr installcheck (MSVC/nmake)
+        shell: cmd
+        working-directory: pgvector
+        run: |
+          call "%VCVARS%" || exit /b 1
+          nmake /NOLOGO /F Makefile.win || exit /b 1
+          nmake /NOLOGO /F Makefile.win install || exit /b 1
+          nmake /NOLOGO /F Makefile.win installcheck || exit /b 1
+          cl 2> ..\cl-version.txt
+          dumpbin /NOLOGO /HEADERS vector.dll > ..\dumpbin-headers.txt || exit /b 1
+          dumpbin /NOLOGO /DEPENDENTS vector.dll > ..\dumpbin-dependents.txt || exit /b 1
+          findstr /C:"machine" ..\dumpbin-headers.txt
+          type ..\dumpbin-dependents.txt
+
+      - name: Mostrar diferencias de regresión
+        if: failure()
+        shell: pwsh
+        run: if (Test-Path pgvector\regression.diffs) { Get-Content pgvector\regression.diffs }
+
+      - name: Reunir archivos de instalación + SHA256
+        shell: pwsh
+        run: |
+          $out = "$env:RUNNER_TEMP\out"
+          New-Item -ItemType Directory $out | Out-Null
+          $sqlfile = "vector--$($env:PGVECTOR_TAG.TrimStart('v')).sql"
+          Copy-Item pgvector\vector.dll, pgvector\vector.control, "pgvector\sql\$sqlfile" $out
+          $machine = (Select-String -Path dumpbin-headers.txt -Pattern 'machine').Line.Trim()
+          if ($machine -notmatch 'x64') { throw "vector.dll no es x64: $machine" }
+          @(
+            "pgvector tag:     $env:PGVECTOR_TAG"
+            "pgvector commit:  $(git -C pgvector rev-parse HEAD)"
+            "postgresql:       $(& pg_config.exe --version)"
+            "postgresql zip:   $env:PG_ZIP_URL_USED"
+            "pg zip sha256:    $env:PG_ZIP_SHA256_REAL"
+            "compilador:       $((Get-Content cl-version.txt | Select-Object -First 1).Trim())"
+            "vector.dll:       $machine"
+            "dependencias:     $((Select-String -Path dumpbin-dependents.txt -Pattern '\.dll$' | ForEach-Object { $_.Line.Trim() }) -join ', ')"
+            "runner:           $env:ImageOS $env:ImageVersion"
+            "workflow run:     $env:GITHUB_SERVER_URL/$env:GITHUB_REPOSITORY/actions/runs/$env:GITHUB_RUN_ID"
+            "installcheck:     OK"
+          ) | Set-Content -Encoding utf8 "$out\BUILD-INFO.txt"
+          Get-ChildItem $out -File | Where-Object Name -ne 'SHA256SUMS.txt' | Sort-Object Name |
+            ForEach-Object { "$((Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLower())  $($_.Name)" } |
+            Set-Content -Encoding ascii "$out\SHA256SUMS.txt"
+          "===== BUILD-INFO.txt"; Get-Content "$out\BUILD-INFO.txt"
+          "===== SHA256SUMS.txt"; Get-Content "$out\SHA256SUMS.txt"
+        env:
+          PG_ZIP_URL_USED: ${{ inputs.pg_zip_url }}
+
+      - name: Publicar artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: pgvector-0.8.7-pg17.11-windows-x64
+          path: ${{ runner.temp }}/out/
+          if-no-files-found: error
+          retention-days: 90
